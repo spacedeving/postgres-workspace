@@ -3,8 +3,11 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 
-def request(path, method="GET", body=None, token="test-password", expected=200):
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+owner_token = ""
+
+
+def request(path, method="GET", body=None, token=None, expected=200):
+    headers = {"Authorization": f"Bearer {owner_token if token is None else token}", "Content-Type": "application/json"}
     data = None if body is None else json.dumps(body).encode()
     try:
         response = urlopen(Request("http://127.0.0.1:8000" + path, data, headers, method=method), timeout=10)
@@ -18,6 +21,11 @@ def request(path, method="GET", body=None, token="test-password", expected=200):
 
 assert b"Postgres Workspace" in request("/")
 request("/tables", token="wrong", expected=401)
+credentials = {"username": "alice", "password": "test-password-alice"}
+owner_token = request("/accounts", "POST", credentials, expected=201)["token"]
+request("/accounts", "POST", credentials, expected=409)
+second_token = request("/accounts", "POST",
+                       {"username": "bob", "password": "test-password-bob"}, expected=201)["token"]
 for name, columns in [
     ("inventory", {"name": "text", "quantity": "integer"}),
     ("applications", {"company": "text", "applied_on": "date", "item_id": "integer"}),
@@ -47,4 +55,14 @@ assert request(inventory + "/rows/" + str(created["id"]), "PATCH", {"quantity": 
 request(inventory + "/rows/" + str(created["id"]), "DELETE")
 request(inventory + "/keys", "DELETE")
 request("/api" + inventory + "/rows", token=key, expected=403)
+assert request("/tables", token=second_token) == []
+request("/tables", "POST", {"name": "inventory", "columns": {"name": "text"}},
+        token=second_token, expected=201)
+assert request(inventory + "/rows", token=second_token) == []
+assert request(inventory + "/rows")[0] == row
+request("/query", "POST", {"sql": "SELECT * FROM pg_authid"}, expected=400)
+request("/sessions/current", "DELETE")
+request("/tables", expected=401)
+owner_token = request("/sessions", "POST", credentials)["token"]
+assert request(inventory + "/rows")[0] == row
 print("PostgreSQL workspace smoke test passed")

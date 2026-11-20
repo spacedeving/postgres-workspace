@@ -4,15 +4,25 @@ import io
 import os
 import re
 import secrets
+from contextlib import asynccontextmanager
 from pathlib import Path
+from uuid import uuid4
 
 import psycopg
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from psycopg import sql
 from psycopg.rows import dict_row
+from pydantic import BaseModel, Field
 
-app = FastAPI(title="Postgres Workspace")
+@asynccontextmanager
+async def lifespan(app):
+    with psycopg.connect(os.environ["DATABASE_URL"]) as db:
+        initialize(db)
+    yield
+
+
+app = FastAPI(title="Postgres Workspace", lifespan=lifespan)
 TYPES = {"text": "text", "integer": "bigint", "decimal": "numeric",
          "boolean": "boolean", "date": "date"}
 NAME = r"[a-z][a-z0-9_]{0,47}"
@@ -30,13 +40,100 @@ def database():
         yield connection
 
 
-def owner(authorization: str = Header(default="")):
-    password = os.environ["WORKSPACE_PASSWORD"]
-    if not password or not secrets.compare_digest(authorization.encode(), ("Bearer " + password).encode()):
-        raise HTTPException(401, "Enter the workspace password.")
-
-
 DB = Depends(database, scope="function")
+
+
+def initialize(db):
+    db.execute("SELECT pg_advisory_xact_lock(63491721)")
+    db.execute("""
+        CREATE SCHEMA IF NOT EXISTS workspace_auth;
+        CREATE TABLE IF NOT EXISTS workspace_auth.accounts (
+            username text PRIMARY KEY, salt bytea NOT NULL,
+            verifier bytea NOT NULL, workspace text UNIQUE NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS workspace_auth.sessions (
+            digest text PRIMARY KEY, workspace text NOT NULL
+            REFERENCES workspace_auth.accounts(workspace),
+            expires_at timestamptz NOT NULL DEFAULT (now() + interval '12 hours')
+        );
+        CREATE TABLE IF NOT EXISTS workspace_auth.keys (
+            digest text PRIMARY KEY, workspace text NOT NULL
+            REFERENCES workspace_auth.accounts(workspace),
+            table_name text NOT NULL, writable boolean NOT NULL
+        );
+    """)
+
+
+def password_hash(password, salt):
+    return hashlib.scrypt(password.encode(), salt=salt, n=16384, r=8, p=1)
+
+
+def session(db, workspace):
+    token = secrets.token_urlsafe(32)
+    db.execute("INSERT INTO workspace_auth.sessions (digest, workspace) VALUES (%s, %s)",
+               (digest(token), workspace))
+    return {"token": token}
+
+
+class Credentials(BaseModel):
+    username: str = Field(min_length=3, max_length=48)
+    password: str = Field(min_length=12, max_length=128)
+
+
+@app.post("/accounts", status_code=201)
+def register(credentials: Credentials, db=DB):
+    username = credentials.username.strip().lower()
+    identifier(username)
+    salt = secrets.token_bytes(16)
+    workspace = "ws_" + uuid4().hex
+    account = db.execute(
+        "INSERT INTO workspace_auth.accounts VALUES (%s, %s, %s, %s) "
+        "ON CONFLICT (username) DO NOTHING RETURNING workspace",
+        (username, salt, password_hash(credentials.password, salt), workspace),
+    ).fetchone()
+    if account is None:
+        raise HTTPException(409, "Username is already taken.")
+    db.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(workspace)))
+    return session(db, workspace)
+
+
+@app.post("/sessions")
+def login(credentials: Credentials, db=DB):
+    account = db.execute("SELECT * FROM workspace_auth.accounts WHERE username = %s",
+                         (credentials.username.strip().lower(),)).fetchone()
+    verifier = password_hash(credentials.password, account["salt"] if account else bytes(16))
+    if account is None or not secrets.compare_digest(verifier, account["verifier"]):
+        raise HTTPException(401, "Username or password is incorrect.")
+    return session(db, account["workspace"])
+
+
+def bearer(authorization):
+    if not authorization.startswith("Bearer ") or len(authorization) > 100:
+        raise HTTPException(401, "Sign in or provide a valid API key.")
+    return digest(authorization[7:])
+
+
+def select_workspace(db, workspace):
+    db.execute(sql.SQL("SET LOCAL search_path TO {}").format(sql.Identifier(workspace)))
+
+
+def owner(authorization: str = Header(default=""), db=DB):
+    record = db.execute("SELECT workspace FROM workspace_auth.sessions "
+                        "WHERE digest = %s AND expires_at > now()",
+                        (bearer(authorization),)).fetchone()
+    if record is None:
+        raise HTTPException(401, "Your session has expired. Sign in again.")
+    select_workspace(db, record["workspace"])
+    return db
+
+
+OWNER = Depends(owner, scope="function")
+
+
+@app.delete("/sessions/current")
+def logout(authorization: str = Header(default=""), db=DB):
+    db.execute("DELETE FROM workspace_auth.sessions WHERE digest = %s", (bearer(authorization),))
+    return {"signed_out": True}
 
 
 @app.exception_handler(psycopg.Error)
@@ -49,29 +146,23 @@ def home():
     return FileResponse(Path(__file__).with_name("index.html"))
 
 
-def table(name):
+def table(db, name):
     identifier(name)
-    return sql.Identifier("workspace_data", name)
+    workspace = db.execute("SELECT current_schema() AS name").fetchone()["name"]
+    return sql.Identifier(workspace, name)
 
 
-def metadata(db):
-    db.execute("SELECT pg_advisory_xact_lock(63491720)")
-    db.execute("CREATE SCHEMA IF NOT EXISTS workspace_data")
-    db.execute("CREATE TABLE IF NOT EXISTS public.workspace_keys "
-               "(digest text PRIMARY KEY, table_name text NOT NULL, writable boolean NOT NULL)")
-
-
-@app.get("/tables", dependencies=[Depends(owner)])
-def tables(db=DB):
+@app.get("/tables")
+def tables(db=OWNER):
     return db.execute(
         "SELECT table_name, json_object_agg(column_name, data_type ORDER BY ordinal_position) AS columns "
-        "FROM information_schema.columns WHERE table_schema = 'workspace_data' "
+        "FROM information_schema.columns WHERE table_schema = current_schema() "
         "GROUP BY table_name ORDER BY table_name"
     ).fetchall()
 
 
-@app.post("/tables", dependencies=[Depends(owner)], status_code=201)
-def create(body: dict, db=DB):
+@app.post("/tables", status_code=201)
+def create(body: dict, db=OWNER):
     name, columns = body.get("name", ""), body.get("columns")
     if not isinstance(name, str) or not isinstance(columns, dict) or not 1 <= len(columns) <= 40:
         raise HTTPException(422, "Provide a table name and 1 to 40 columns.")
@@ -80,13 +171,12 @@ def create(body: dict, db=DB):
         if not isinstance(kind, str) or kind not in TYPES or column == "id":
             raise HTTPException(422, "Choose a supported type and reserve id for the primary key.")
         definitions.append(sql.SQL("{} {}").format(identifier(column), sql.SQL(TYPES[kind])))
-    metadata(db)
-    db.execute(sql.SQL("CREATE TABLE {} ({})").format(table(name), sql.SQL(", ").join(definitions)))
+    db.execute(sql.SQL("CREATE TABLE {} ({})").format(table(db, name), sql.SQL(", ").join(definitions)))
     return {"name": name}
 
 
 def rows(db, name, offset=0):
-    return db.execute(sql.SQL("SELECT * FROM {} ORDER BY id LIMIT 100 OFFSET %s").format(table(name)),
+    return db.execute(sql.SQL("SELECT * FROM {} ORDER BY id LIMIT 100 OFFSET %s").format(table(db, name)),
                       (offset,)).fetchall()
 
 
@@ -98,11 +188,11 @@ def save(db, name, data, row_id=None):
     columns = [identifier(key) for key in data]
     if row_id is None:
         query = sql.SQL("INSERT INTO {} ({}) VALUES ({}) RETURNING *").format(
-            table(name), sql.SQL(", ").join(columns), sql.SQL(", ").join([sql.Placeholder()] * len(columns)))
+            table(db, name), sql.SQL(", ").join(columns), sql.SQL(", ").join([sql.Placeholder()] * len(columns)))
         params = list(data.values())
     else:
         query = sql.SQL("UPDATE {} SET {} WHERE id = %s RETURNING *").format(
-            table(name), sql.SQL(", ").join(sql.SQL("{} = %s").format(column) for column in columns))
+            table(db, name), sql.SQL(", ").join(sql.SQL("{} = %s").format(column) for column in columns))
         params = [*data.values(), row_id]
     result = db.execute(query, params).fetchone()
     if result is None:
@@ -110,13 +200,13 @@ def save(db, name, data, row_id=None):
     return result
 
 
-@app.get("/tables/{name}/rows", dependencies=[Depends(owner)])
-def get_rows(name: str, offset: int = 0, db=DB):
+@app.get("/tables/{name}/rows")
+def get_rows(name: str, offset: int = 0, db=OWNER):
     return rows(db, name, max(0, offset))
 
 
-@app.post("/tables/{name}/import", dependencies=[Depends(owner)])
-def import_csv(name: str, body: dict, db=DB):
+@app.post("/tables/{name}/import")
+def import_csv(name: str, body: dict, db=OWNER):
     content = body.get("csv")
     if not isinstance(content, str) or len(content) > 2_000_000:
         raise HTTPException(422, "Choose a CSV file under 2 MB.")
@@ -136,35 +226,35 @@ def import_csv(name: str, body: dict, db=DB):
     return {"imported": count}
 
 
-@app.post("/tables/{name}/relationships", dependencies=[Depends(owner)])
-def relationship(name: str, body: dict, db=DB):
+@app.post("/tables/{name}/relationships")
+def relationship(name: str, body: dict, db=OWNER):
     column, target = body.get("column"), body.get("target")
     if not isinstance(column, str) or not isinstance(target, str) or column == "id":
         raise HTTPException(422, "Select a column and a referenced table.")
     db.execute(sql.SQL("ALTER TABLE {} ADD FOREIGN KEY ({}) REFERENCES {} (id)").format(
-        table(name), identifier(column), table(target)))
+        table(db, name), identifier(column), table(db, target)))
     return {"column": column, "target": target}
 
 
-@app.post("/tables/{name}/rows", dependencies=[Depends(owner)])
-def insert(name: str, body: dict, db=DB):
+@app.post("/tables/{name}/rows")
+def insert(name: str, body: dict, db=OWNER):
     return save(db, name, body)
 
 
-@app.patch("/tables/{name}/rows/{row_id}", dependencies=[Depends(owner)])
-def update(name: str, row_id: int, body: dict, db=DB):
+@app.patch("/tables/{name}/rows/{row_id}")
+def update(name: str, row_id: int, body: dict, db=OWNER):
     return save(db, name, body, row_id)
 
 
-@app.delete("/tables/{name}/rows/{row_id}", dependencies=[Depends(owner)])
-def delete(name: str, row_id: int, db=DB):
-    if not db.execute(sql.SQL("DELETE FROM {} WHERE id = %s").format(table(name)), (row_id,)).rowcount:
+@app.delete("/tables/{name}/rows/{row_id}")
+def delete(name: str, row_id: int, db=OWNER):
+    if not db.execute(sql.SQL("DELETE FROM {} WHERE id = %s").format(table(db, name)), (row_id,)).rowcount:
         raise HTTPException(404, "Row not found.")
     return {"deleted": row_id}
 
 
-@app.post("/query", dependencies=[Depends(owner)])
-def query(body: dict, db=DB):
+@app.post("/query")
+def query(body: dict, db=OWNER):
     statement = body.get("sql", "")
     match = re.fullmatch(
         rf"SELECT\s+(\*|{NAME}(?:\s*,\s*{NAME})*)\s+FROM\s+({NAME})"
@@ -177,7 +267,7 @@ def query(body: dict, db=DB):
     projection, name, where, value, order, direction = match.groups()
     columns = sql.SQL("*") if projection == "*" else sql.SQL(", ").join(
         identifier(column.strip().lower()) for column in projection.split(","))
-    command = sql.SQL("SELECT {} FROM {}").format(columns, table(name.lower()))
+    command = sql.SQL("SELECT {} FROM {}").format(columns, table(db, name.lower()))
     params = ()
     if where:
         command += sql.SQL(" WHERE {} = %s").format(identifier(where.lower()))
@@ -193,27 +283,27 @@ def digest(token):
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-@app.post("/tables/{name}/keys", dependencies=[Depends(owner)])
-def issue_key(name: str, body: dict, db=DB):
-    db.execute(sql.SQL("SELECT 1 FROM {} LIMIT 0").format(table(name)))
+@app.post("/tables/{name}/keys")
+def issue_key(name: str, body: dict, db=OWNER):
+    db.execute(sql.SQL("SELECT 1 FROM {} LIMIT 0").format(table(db, name)))
     token = secrets.token_urlsafe(32)
-    db.execute("INSERT INTO public.workspace_keys VALUES (%s, %s, %s)",
+    db.execute("INSERT INTO workspace_auth.keys VALUES (%s, current_schema(), %s, %s)",
                (digest(token), name, body.get("writable") is True))
     return {"key": token}
 
 
-@app.delete("/tables/{name}/keys", dependencies=[Depends(owner)])
-def revoke_keys(name: str, db=DB):
-    return {"revoked": db.execute("DELETE FROM public.workspace_keys WHERE table_name = %s", (name,)).rowcount}
+@app.delete("/tables/{name}/keys")
+def revoke_keys(name: str, db=OWNER):
+    return {"revoked": db.execute("DELETE FROM workspace_auth.keys WHERE workspace = current_schema() AND table_name = %s", (name,)).rowcount}
 
 
 def authorize(db, token, name, write=False):
-    if not token.startswith("Bearer "):
-        raise HTTPException(401, "Provide a table API key.")
-    key = db.execute("SELECT writable FROM public.workspace_keys WHERE digest = %s AND table_name = %s",
-                     (digest(token[7:]), name)).fetchone()
+    key = db.execute("SELECT workspace, writable FROM workspace_auth.keys "
+                     "WHERE digest = %s AND table_name = %s",
+                     (bearer(token), name)).fetchone()
     if key is None or (write and not key["writable"]):
         raise HTTPException(403, "This API key lacks permission.")
+    select_workspace(db, key["workspace"])
 
 
 @app.get("/api/tables/{name}/rows")

@@ -4,7 +4,11 @@ A personal database app backed by PostgreSQL. Create typed tables in a browser, 
 
 ## Start locally
 
-Create a .env file containing WORKSPACE_PASSWORD with a strong password, then run `docker compose up --build`. Open http://127.0.0.1:8000 and enter that password. PostgreSQL data persists in the Compose volume across restarts.
+Run `docker compose up --build`, open http://127.0.0.1:8000, and choose **Create account**. Use a unique password of at least 12 characters. PostgreSQL data persists in the Compose volume across restarts.
+
+## Deploy a portfolio demo
+
+The included `render.yaml` defines a Docker web service and a PostgreSQL database on Render. In a Render account, create a Blueprint from this repository, check the plan terms, and deploy it. Open the web service URL, create an account, and follow the walkthrough below. The Blueprint uses demo tiers. Review storage lifetime before relying on it for data you need to keep.
 
 ## Try it
 
@@ -16,6 +20,6 @@ Create a .env file containing WORKSPACE_PASSWORD with a strong password, then ru
 
 ## Implementation notes
 
-The Compose setup serves one password-protected workspace on loopback. Tables are real PostgreSQL tables in a dedicated schema. The SQL editor translates a restricted SELECT syntax into parameterized PostgreSQL statements. It supports column selection, equality filters, sorting, and up to 100 rows per query. The API stores only hashes of generated keys. Read/write keys can append rows and read keys can list rows. The grid supports row creation, editing, deletion, pagination, CSV import into an existing table, and export of the visible page. To link tables, create an integer column and use Add relationship to reference the other table's id.
+Each account has a dedicated PostgreSQL schema. The server resolves it from an expiring session or a table-scoped API key and explicitly qualifies every user table. Passwords use salted scrypt hashes. Sessions and API keys are stored as hashes, and signing out invalidates the session. The SQL editor translates a restricted SELECT syntax into parameterized PostgreSQL statements. It supports column selection, equality filters, sorting, and up to 100 rows per query. Read/write keys can append rows and read keys can list rows. The grid supports row creation, editing, deletion, pagination, CSV import into an existing table, and export of the visible page. To link tables, create an integer column and use Add relationship to reference the other table's id.
 
-GitHub Actions runs the smoke test against real PostgreSQL using Compose. The app currently targets one owner and one workspace. A hosted multi-user edition would need user accounts, workspace isolation, and a production deployment configuration.
+GitHub Actions runs the smoke test against real PostgreSQL using Compose. The test exercises two accounts with identically named tables as well as SQL and API access. If you ran the prior single-password version, its data remains in the old workspace_data schema. New accounts get fresh workspaces, and the app does not automatically assign the old data to an account.

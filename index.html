@@ -6,7 +6,10 @@
 </style></head><body>
 <header><h1>Postgres Workspace</h1><button id="logout" hidden>Lock workspace</button></header>
 <main><p role="status" id="message"></p>
-<section id="login"><h2>Open workspace</h2><form id="signin"><label>Workspace password <input required type="password" autocomplete="current-password"></label> <button class="primary">Open</button></form></section>
+<section id="login"><h2>Sign in to your workspace</h2><form id="signin">
+<label>Username <input required name="username" minlength="3" maxlength="48" autocomplete="username"></label>
+<label>Password <input required name="password" type="password" minlength="12" maxlength="128" autocomplete="current-password"></label>
+<button class="primary" value="sessions">Sign in</button> <button value="accounts">Create account</button></form></section>
 <div id="workspace" hidden><nav aria-label="Workspace views"><button id="gridTab" aria-current="true">Tables</button><button id="sqlTab">SQL editor</button><button id="apiTab">API access</button></nav>
 <div class="layout"><aside id="sidebar"><div class="actions"><button id="newTable" class="primary">New table</button></div><div id="tables"></div></aside>
 <section id="panel" aria-label="Active view"></section></div></div></main>
@@ -18,7 +21,7 @@ const element = (tag, text) => {
   if (text !== undefined) item.textContent = text;
   return item;
 };
-let password = sessionStorage.getItem("workspacePassword") || "";
+let token = sessionStorage.getItem("workspaceSession") || "";
 let tables = [], selected = null, page = 0, view = "grid", renderVersion = 0;
 let queryText = "";
 function status(message, error = false) {
@@ -27,7 +30,7 @@ function status(message, error = false) {
 }
 async function request(path, method = "GET", data) {
   const response = await fetch(path, {
-    method, headers: {"Content-Type": "application/json", Authorization: "Bearer " + password},
+    method, headers: {"Content-Type": "application/json", Authorization: "Bearer " + token},
     body: data === undefined ? undefined : JSON.stringify(data)
   });
   const result = await response.json();
@@ -206,21 +209,31 @@ get("newTable").onclick = () => {
 };
 async function openWorkspace() {
   await refresh();
-  sessionStorage.setItem("workspacePassword", password);
+  sessionStorage.setItem("workspaceSession", token);
   get("signin").reset();
   get("login").hidden = true;
   get("workspace").hidden = get("logout").hidden = false;
   status("");
 }
 get("signin").onsubmit = async event => {
-  event.preventDefault(); password = event.currentTarget.querySelector("input").value;
-  try { await openWorkspace(); } catch (error) { status(error.message,true); }
+  event.preventDefault();
+  const data = Object.fromEntries(new FormData(event.currentTarget));
+  try {
+    const response = await request("/" + event.submitter.value, "POST", data);
+    token = response.token;
+    await openWorkspace();
+  } catch (error) { status(error.message, true); }
 };
-get("logout").onclick = () => { sessionStorage.removeItem("workspacePassword"); location.reload(); };
+get("logout").onclick = async () => {
+  try { await request("/sessions/current", "DELETE"); }
+  catch (error) { status(error.message, true); return; }
+  sessionStorage.removeItem("workspaceSession");
+  location.reload();
+};
 get("cancel").onclick = () => get("dialog").close();
 for (const tab of ["grid","sql","api"]) get(tab + "Tab").onclick = async () => {
   view = tab;
   try { await render(); } catch (error) { status(error.message,true); }
 };
-if (password) openWorkspace().catch(error => status(error.message,true));
+if (token) openWorkspace().catch(error => status(error.message,true));
 </script></body></html>

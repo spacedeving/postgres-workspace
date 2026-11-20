@@ -6,8 +6,6 @@ jobs:
   smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      WORKSPACE_PASSWORD: test-password
     steps:
       - uses: actions/checkout@v4
       - run: docker compose up --build -d

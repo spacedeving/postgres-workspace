@@ -14,7 +14,6 @@ services:
     build: .
     environment:
       DATABASE_URL: postgresql://workspace:workspace_demo@database/workspace
-      WORKSPACE_PASSWORD: ${WORKSPACE_PASSWORD:?Set WORKSPACE_PASSWORD in .env}
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
