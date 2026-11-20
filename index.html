@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Postgres Workspace</title>
+<style>
+:root{font:16px system-ui;color:#192420;background:#f3f5f3}*{box-sizing:border-box}body{margin:0}header{background:#18372d;color:white;padding:20px 4vw;display:flex;justify-content:space-between;align-items:center;gap:12px}h1{font-size:21px;margin:0}h2{margin-top:0}main{padding:28px 4vw;max-width:1440px;margin:auto}button,input,select,textarea{font:inherit;padding:8px 11px;border:1px solid #abbdb5;border-radius:6px;background:white;color:#192420}button{cursor:pointer;font-weight:600}button.primary{background:#226248;color:#fff;border-color:#226248}button[aria-current=true]{background:#d8eae0}label{display:inline-flex;align-items:center;gap:8px}nav,.actions{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 16px}.layout{display:grid;grid-template-columns:230px minmax(0,1fr);gap:20px}section,aside{background:white;border:1px solid #d6e0da;border-radius:10px;padding:16px}aside button{display:block;width:100%;margin-bottom:8px;text-align:left}.scroll{overflow:auto}table{border-collapse:collapse;width:100%}th,td{border-bottom:1px solid #d6e0da;padding:9px;text-align:left;white-space:nowrap}th{background:#eaf2ed}textarea{width:100%;min-height:115px;font-family:monospace}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#edf3ef;padding:12px}dialog{max-width:min(95vw,550px);width:100%;border:1px solid #abbdb5;border-radius:10px}dialog::backdrop{background:#18372d88}dialog label{display:flex;margin-bottom:10px;justify-content:space-between;flex-wrap:wrap}.error{color:#972e25}small{color:#50665c}@media(max-width:680px){.layout{grid-template-columns:1fr}}
+</style></head><body>
+<header><h1>Postgres Workspace</h1><button id="logout" hidden>Lock workspace</button></header>
+<main><p role="status" id="message"></p>
+<section id="login"><h2>Open workspace</h2><form id="signin"><label>Workspace password <input required type="password" autocomplete="current-password"></label> <button class="primary">Open</button></form></section>
+<div id="workspace" hidden><nav aria-label="Workspace views"><button id="gridTab" aria-current="true">Tables</button><button id="sqlTab">SQL editor</button><button id="apiTab">API access</button></nav>
+<div class="layout"><aside id="sidebar"><div class="actions"><button id="newTable" class="primary">New table</button></div><div id="tables"></div></aside>
+<section id="panel" aria-label="Active view"></section></div></div></main>
+<dialog id="dialog"><form id="editor"><h2 id="dialogTitle"></h2><div id="fields"></div><p id="formError" class="error" role="alert"></p><div class="actions"><button id="cancel" type="button">Cancel</button><button class="primary">Save</button></div></form></dialog>
+<script>
+const get = id => document.getElementById(id);
+const element = (tag, text) => {
+  const item = document.createElement(tag);
+  if (text !== undefined) item.textContent = text;
+  return item;
+};
+let password = sessionStorage.getItem("workspacePassword") || "";
+let tables = [], selected = null, page = 0, view = "grid", renderVersion = 0;
+let queryText = "";
+function status(message, error = false) {
+  get("message").textContent = message;
+  get("message").className = error ? "error" : "";
+}
+async function request(path, method = "GET", data) {
+  const response = await fetch(path, {
+    method, headers: {"Content-Type": "application/json", Authorization: "Bearer " + password},
+    body: data === undefined ? undefined : JSON.stringify(data)
+  });
+  const result = await response.json();
+  if (!response.ok) throw new Error(typeof result.detail === "string" ? result.detail : "Check your input and try again.");
+  return result;
+}
+function button(label, action) {
+  const control = element("button", label);
+  control.type = "button";
+  control.onclick = async () => {
+    control.disabled = true;
+    try { await action(); } catch (error) { status(error.message, true); }
+    finally { control.disabled = false; }
+  };
+  return control;
+}
+function dataGrid(columns, rows, edit) {
+  const wrapper = element("div"); wrapper.className = "scroll";
+  const table = element("table");
+  const header = table.createTHead().insertRow();
+  columns.forEach(name => header.append(element("th", name)));
+  if (edit) header.append(element("th", "Actions"));
+  const body = table.createTBody();
+  for (const row of rows) {
+    const tr = body.insertRow();
+    columns.forEach(name => tr.insertCell().textContent = row[name] === null ? "NULL" : String(row[name] ?? ""));
+    if (edit) tr.insertCell().append(button("Edit", () => edit(row)), " ",
+      button("Delete", async () => {
+        if (confirm("Delete this row?")) {
+          await request("/tables/" + selected + "/rows/" + row.id, "DELETE");
+          await render();
+        }
+      }));
+  }
+  wrapper.append(table);
+  if (!rows.length) wrapper.append(element("p", "No rows found."));
+  return wrapper;
+}
+async function refresh() {
+  tables = await request("/tables");
+  if (!tables.some(table => table.table_name === selected)) selected = tables[0]?.table_name ?? null;
+  await render();
+}
+async function render() {
+  const generation = ++renderVersion;
+  for (const tab of ["grid","sql","api"]) get(tab + "Tab").setAttribute("aria-current", String(view === tab));
+  get("tables").replaceChildren(...tables.map(({table_name}) => {
+    const control = button(table_name, async () => { selected = table_name; page = 0; await render(); });
+    control.setAttribute("aria-current", String(selected === table_name));
+    return control;
+  }));
+  const panel = get("panel");
+  const active = tables.find(table => table.table_name === selected);
+  panel.replaceChildren(element("h2", view === "sql" ? "SQL editor" : view === "api" ? "API access" : selected || "Create your first table"));
+  if (view === "sql") {
+    const input = element("textarea");
+    input.setAttribute("aria-label", "SQL statement");
+    input.value = queryText || (selected ? "SELECT * FROM " + selected + " ORDER BY id;" : "");
+    input.oninput = () => { queryText = input.value; };
+    const result = element("div");
+    panel.append(element("p", "Read up to 100 rows. Supports SELECT, equality filters and sorting."),
+      input, button("Run query", async () => {
+        const response = await request("/query", "POST", {sql: input.value});
+        result.replaceChildren(dataGrid(response.columns, response.rows));
+      }), result);
+    return;
+  }
+  if (!active) { panel.append(element("p", "Use New table to define your own columns.")); return; }
+  const path = "/tables/" + selected;
+  if (view === "api") {
+    const endpoint = location.origin + "/api" + path + "/rows";
+    const sample = element("pre", "GET " + endpoint + "\nAuthorization: Bearer YOUR_KEY");
+    panel.append(element("p", "Keys are scoped to " + selected + ". Save your key when it appears."),
+      button("Create read key", async () => {
+        const {key} = await request(path + "/keys", "POST", {writable:false});
+        sample.textContent = "GET " + endpoint + "\nAuthorization: Bearer " + key;
+      }), " ", button("Create read/write key", async () => {
+        const {key} = await request(path + "/keys", "POST", {writable:true});
+        sample.textContent = "GET or POST " + endpoint + "\nAuthorization: Bearer " + key;
+      }), " ", button("Revoke table keys", async () => {
+        if (confirm("Revoke all API keys for this table?")) {
+          await request(path + "/keys", "DELETE");
+          sample.textContent = "All keys revoked.";
+        }
+      }), sample);
+    return;
+  }
+  const rows = await request(path + "/rows?offset=" + page * 100);
+  if (generation !== renderVersion) return;
+  const actions = element("div"); actions.className = "actions";
+  actions.append(button("Add row", () => rowEditor(active, path)),
+    button("Import CSV", () => {
+      const file = element("input"); file.type = "file"; file.accept = ".csv,text/csv"; file.required = true;
+      dialog("Import CSV", field("CSV file", file), async () => {
+        if (file.files[0].size > 2000000) throw new Error("Choose a CSV file under 2 MB.");
+        const result = await request(path + "/import", "POST", {csv: await file.files[0].text()});
+        status("Imported " + result.imported + " rows.");
+        await render();
+      });
+    }),
+    button("Add relationship", () => {
+      const fields = document.createDocumentFragment();
+      const column = element("select"), target = element("select");
+      for (const [name, type] of Object.entries(active.columns)) {
+        if (name !== "id" && type === "bigint") column.add(new Option(name, name));
+      }
+      if (!column.length) throw new Error("Create an integer column to reference another table.");
+      tables.forEach(table => target.add(new Option(table.table_name, table.table_name)));
+      fields.append(field("Integer column", column), field("Referenced table", target));
+      dialog("Add foreign key", fields, async () => {
+        await request(path + "/relationships", "POST", {column:column.value,target:target.value});
+        status("Relationship created.");
+      });
+    }),
+    button("Export page CSV", () => exportCsv(active, rows)),
+    button("Filter or sort in SQL", async () => { view = "sql"; queryText = ""; await render(); }));
+  if (page) actions.append(button("Previous page", async () => { page--; await render(); }));
+  if (rows.length === 100) actions.append(button("Next page", async () => { page++; await render(); }));
+  panel.append(element("small", "Page " + (page+1)), actions, dataGrid(Object.keys(active.columns), rows,
+    row => rowEditor(active, path, row)));
+}
+function exportCsv(active, rows) {
+  const columns = Object.keys(active.columns);
+  const escape = value => '"' + String(value ?? "").replace(/"/g, '""') + '"';
+  const csv = [columns, ...rows.map(row => columns.map(name => row[name]))]
+    .map(row => row.map(escape).join(",")).join("\r\n");
+  const url = URL.createObjectURL(new Blob([csv], {type:"text/csv"}));
+  const link = element("a"); link.href = url; link.download = active.table_name + ".csv"; link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+function dialog(title, content, action) {
+  get("dialogTitle").textContent = title;
+  get("fields").replaceChildren(content);
+  get("formError").textContent = "";
+  get("editor").onsubmit = async event => {
+    event.preventDefault();
+    const submit = event.submitter;
+    submit.disabled = true;
+    try { await action(); get("dialog").close(); }
+    catch (error) { get("formError").textContent = error.message; }
+    finally { submit.disabled = false; }
+  };
+  get("dialog").showModal();
+}
+function field(title, input) {
+  const label = element("label", title); label.append(input); return label;
+}
+function rowEditor(active, path, row) {
+  const fields = document.createDocumentFragment();
+  const inputs = Object.keys(active.columns).filter(name => name !== "id").map(name => {
+    const input = element("input");
+    input.value = row?.[name] ?? "";
+    fields.append(field(name + " (" + active.columns[name] + ")", input));
+    return [name,input];
+  });
+  dialog(row ? "Edit row" : "Add row", fields, async () => {
+    const body = Object.fromEntries(inputs.map(([name,input]) => [name,input.value === "" ? null : input.value]));
+    await request(path + "/rows" + (row ? "/" + row.id : ""), row ? "PATCH" : "POST", body);
+    await render();
+  });
+}
+get("newTable").onclick = () => {
+  const fields = document.createDocumentFragment();
+  const name = element("input"); name.required = true; name.pattern = "[a-z][a-z0-9_]{0,47}";
+  const columns = element("textarea");
+  columns.required = true; columns.placeholder = "name:text\nquantity:integer";
+  fields.append(field("Table name", name), field("Columns, one name:type per line", columns),
+    element("small", "Types: text, integer, decimal, boolean, date. An id column is added automatically."));
+  dialog("New table", fields, async () => {
+    const pairs = columns.value.trim().split(/\r?\n/).map(line => line.split(":").map(part => part.trim()));
+    if (pairs.some(pair => pair.length !== 2 || !pair[0] || !pair[1]) ||
+        new Set(pairs.map(pair => pair[0])).size !== pairs.length) throw new Error("Use unique name:type pairs.");
+    await request("/tables","POST",{name:name.value,columns:Object.fromEntries(pairs)});
+    selected = name.value; page = 0; view = "grid"; await refresh();
+  });
+};
+async function openWorkspace() {
+  await refresh();
+  sessionStorage.setItem("workspacePassword", password);
+  get("signin").reset();
+  get("login").hidden = true;
+  get("workspace").hidden = get("logout").hidden = false;
+  status("");
+}
+get("signin").onsubmit = async event => {
+  event.preventDefault(); password = event.currentTarget.querySelector("input").value;
+  try { await openWorkspace(); } catch (error) { status(error.message,true); }
+};
+get("logout").onclick = () => { sessionStorage.removeItem("workspacePassword"); location.reload(); };
+get("cancel").onclick = () => get("dialog").close();
+for (const tab of ["grid","sql","api"]) get(tab + "Tab").onclick = async () => {
+  view = tab;
+  try { await render(); } catch (error) { status(error.message,true); }
+};
+if (password) openWorkspace().catch(error => status(error.message,true));
+</script></body></html>

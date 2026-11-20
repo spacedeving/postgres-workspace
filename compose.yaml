@@ -1,0 +1,24 @@
+services:
+  database:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: workspace
+      POSTGRES_PASSWORD: workspace_demo
+    volumes:
+      - workspace_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "workspace"]
+      interval: 2s
+      retries: 20
+  app:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://workspace:workspace_demo@database/workspace
+      WORKSPACE_PASSWORD: ${WORKSPACE_PASSWORD:?Set WORKSPACE_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      database:
+        condition: service_healthy
+volumes:
+  workspace_data:
